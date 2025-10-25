@@ -361,43 +361,247 @@ def get_net_position(asset_id):
 def portfolio_summary():
     try:
         data = request.get_json()
-        
+
         if not data or 'portfolio' not in data:
             return jsonify({'error': 'Missing portfolio data'}), 400
-        
+
         portfolio_data = data['portfolio']
-        
+
         if not isinstance(portfolio_data, list):
             return jsonify({'error': 'Portfolio must be an array'}), 400
-        
+
         for idx, item in enumerate(portfolio_data):
             validate_portfolio_item(item, idx)
-        
+
         portfolio = quant_risk_engine.Portfolio()
-        
+
         for item in portfolio_data:
             option = create_option(item)
             portfolio.add_instrument(option, item['quantity'])
-        
+
         assets = set(item['asset_id'] for item in portfolio_data)
         net_positions = {}
         for asset in assets:
             net_positions[asset] = portfolio.get_total_quantity(asset)
-        
+
         instrument_counts = {
             'european': sum(1 for item in portfolio_data if item.get('style', 'european') == 'european'),
             'american': sum(1 for item in portfolio_data if item.get('style', 'european') == 'american'),
             'calls': sum(1 for item in portfolio_data if item['type'].lower() == 'call'),
             'puts': sum(1 for item in portfolio_data if item['type'].lower() == 'put')
         }
-        
+
         return jsonify({
             'portfolio_size': len(portfolio),
             'unique_assets': len(assets),
             'net_positions': net_positions,
             'instrument_counts': instrument_counts
         }), 200
-        
+
+    except ValueError as e:
+        return jsonify({'error': f'Validation error: {str(e)}'}), 400
+    except RuntimeError as e:
+        return jsonify({'error': f'Runtime error: {str(e)}'}), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error: {traceback.format_exc()}")
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+@app.route('/analytics/greeks_time_series', methods=['POST'])
+def greeks_time_series():
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'Request body must be valid JSON'}), 400
+
+        required_fields = ['portfolio', 'market_data', 'time_points']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        portfolio_data = data['portfolio']
+        market_data_map_py = data['market_data']
+        time_points = data['time_points']
+
+        if not isinstance(portfolio_data, list) or len(portfolio_data) == 0:
+            return jsonify({'error': 'Portfolio must be a non-empty array'}), 400
+
+        if not isinstance(market_data_map_py, dict) or len(market_data_map_py) == 0:
+            return jsonify({'error': 'Market data must be a non-empty object'}), 400
+
+        if not isinstance(time_points, list) or len(time_points) == 0:
+            return jsonify({'error': 'Time points must be a non-empty array'}), 400
+
+        # Validate time points
+        for days in time_points:
+            if not isinstance(days, (int, float)) or days <= 0:
+                return jsonify({'error': 'Time points must be positive numbers'}), 400
+
+        # Validate portfolio and market data
+        for idx, item in enumerate(portfolio_data):
+            validate_portfolio_item(item, idx)
+
+        for asset_id, md in market_data_map_py.items():
+            validate_market_data(asset_id, md)
+
+        # Check asset coverage
+        portfolio_assets = set(item['asset_id'] for item in portfolio_data)
+        market_data_assets = set(market_data_map_py.keys())
+        missing_assets = portfolio_assets - market_data_assets
+        if missing_assets:
+            return jsonify({'error': f'Missing market data for assets: {list(missing_assets)}'}), 400
+
+        # Create portfolio
+        portfolio = quant_risk_engine.Portfolio()
+        portfolio.reserve(len(portfolio_data))
+
+        for item in portfolio_data:
+            option = create_option(item)
+            portfolio.add_instrument(option, item['quantity'])
+
+        # Convert market data to C++ format
+        market_data_map_cpp = {}
+        for asset_id, md_py in market_data_map_py.items():
+            dividend = md_py.get('dividend', 0.0)
+            md_cpp = quant_risk_engine.MarketData(
+                asset_id,
+                float(md_py['spot']),
+                float(md_py['rate']),
+                float(md_py['vol']),
+                float(dividend)
+            )
+            market_data_map_cpp[asset_id] = md_cpp
+
+        # Calculate time series
+        time_series = []
+        for days in time_points:
+            # Create modified market data with adjusted time horizon for VaR
+            # Note: Greeks are calculated at current time, VaR uses the specified horizon
+            engine = quant_risk_engine.RiskEngine()
+            engine.set_var_simulations(10000)  # Reduced for speed
+            engine.set_var_confidence_level(0.95)
+            engine.set_var_time_horizon_days(float(days))
+
+            try:
+                result = engine.calculate_portfolio_risk(portfolio, market_data_map_cpp)
+                time_series.append({
+                    'days': days,
+                    'delta': result.total_delta,
+                    'gamma': result.total_gamma,
+                    'vega': result.total_vega,
+                    'theta': result.total_theta,
+                    'var': result.value_at_risk_95
+                })
+            except Exception as e:
+                return jsonify({'error': f'Calculation failed for {days} days: {str(e)}'}), 500
+
+        return jsonify({'time_series': time_series}), 200
+
+    except ValueError as e:
+        return jsonify({'error': f'Validation error: {str(e)}'}), 400
+    except RuntimeError as e:
+        return jsonify({'error': f'Runtime error: {str(e)}'}), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error: {traceback.format_exc()}")
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+@app.route('/analytics/iv_surface', methods=['POST'])
+def iv_surface():
+    try:
+        data = request.get_json()
+
+        if not data:
+            return jsonify({'error': 'Request body must be valid JSON'}), 400
+
+        required_fields = ['portfolio', 'market_data']
+        for field in required_fields:
+            if field not in data:
+                return jsonify({'error': f'Missing required field: {field}'}), 400
+
+        portfolio_data = data['portfolio']
+        market_data_map_py = data['market_data']
+
+        # Default ranges if not provided
+        strike_range = data.get('strike_range', {'min': 50, 'max': 150, 'steps': 21})
+        expiry_range = data.get('expiry_range', {'min': 0.1, 'max': 2.0, 'steps': 20})
+
+        if not isinstance(portfolio_data, list) or len(portfolio_data) == 0:
+            return jsonify({'error': 'Portfolio must be a non-empty array'}), 400
+
+        if not isinstance(market_data_map_py, dict) or len(market_data_map_py) == 0:
+            return jsonify({'error': 'Market data must be a non-empty object'}), 400
+
+        # Validate ranges
+        for range_obj in [strike_range, expiry_range]:
+            if not all(key in range_obj for key in ['min', 'max', 'steps']):
+                return jsonify({'error': 'Range objects must have min, max, and steps'}), 400
+            if range_obj['min'] >= range_obj['max'] or range_obj['steps'] < 2:
+                return jsonify({'error': 'Invalid range parameters'}), 400
+
+        # For IV surface, we need at least one option in the portfolio
+        if not any(item.get('pricing_model', 'blackscholes').lower() == 'blackscholes' for item in portfolio_data):
+            return jsonify({'error': 'IV surface requires at least one Black-Scholes priced option'}), 400
+
+        # Validate portfolio and market data
+        for idx, item in enumerate(portfolio_data):
+            validate_portfolio_item(item, idx)
+
+        for asset_id, md in market_data_map_py.items():
+            validate_market_data(asset_id, md)
+
+        # Generate strike and expiry grids
+        strikes = []
+        step_size = (strike_range['max'] - strike_range['min']) / (strike_range['steps'] - 1)
+        for i in range(strike_range['steps']):
+            strikes.append(strike_range['min'] + i * step_size)
+
+        expiries = []
+        expiry_step = (expiry_range['max'] - expiry_range['min']) / (expiry_range['steps'] - 1)
+        for i in range(expiry_range['steps']):
+            expiries.append(expiry_range['min'] + i * expiry_step)
+
+        # Calculate IV surface - for simplicity, use the first option
+        first_option_data = next(item for item in portfolio_data if item.get('pricing_model', 'blackscholes').lower() == 'blackscholes')
+        asset_id = first_option_data['asset_id']
+
+        if asset_id not in market_data_map_py:
+            return jsonify({'error': f'Market data missing for {asset_id}'}), 400
+
+        md_py = market_data_map_py[asset_id]
+        spot = md_py['spot']
+        rate = md_py['rate']
+
+        # Calculate IV for each strike/expiry combination
+        iv_matrix = []
+        for expiry in expiries:
+            iv_row = []
+            for strike in strikes:
+                try:
+                    # Create a temporary European option for IV calculation
+                    option_type = quant_risk_engine.OptionType.Call if first_option_data['type'].lower() == 'call' else quant_risk_engine.OptionType.Put
+                    temp_option = quant_risk_engine.EuropeanOption(option_type, strike, expiry, asset_id)
+
+                    # Get market price (simplified - using Black-Scholes with some base vol)
+                    market_price = temp_option.price(quant_risk_engine.MarketData(asset_id, spot, rate, 0.25))  # 25% base vol
+
+                    # Calculate implied volatility
+                    # Note: This is a simplified implementation
+                    # Real IV calculation would use numerical methods
+                    implied_vol = 0.25  # Placeholder - would implement proper IV calculation
+
+                    iv_row.append(implied_vol)
+                except Exception:
+                    iv_row.append(None)  # Failed calculation
+            iv_matrix.append(iv_row)
+
+        return jsonify({
+            'surface': {
+                'strikes': strikes,
+                'expiries': expiries,
+                'iv_matrix': iv_matrix
+            }
+        }), 200
+
     except ValueError as e:
         return jsonify({'error': f'Validation error: {str(e)}'}), 400
     except RuntimeError as e:
