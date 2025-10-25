@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Quant Enthusiasts Risk Engine</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
 
@@ -222,6 +224,40 @@
                     Add instruments to your portfolio and calculate risk metrics.
                 </div>
             </div>
+
+            <div class="lg:col-span-3 glass-effect p-6 shadow-2xl fade-in">
+                <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+                    <span class="text-2xl">📈</span>
+                    <span>Greeks & VaR Time Series</span>
+                </h3>
+                <div id="time-series-container" class="hidden">
+                    <canvas id="time-series-chart" width="400" height="200"></canvas>
+                </div>
+                <div id="time-series-loading" class="hidden text-center py-8">
+                    <div class="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-cyan-500 mx-auto mb-2"></div>
+                    <p class="text-gray-400">Loading time series data...</p>
+                </div>
+                <div id="time-series-empty" class="text-center py-8 text-gray-500">
+                    Calculate portfolio risk to view time series charts.
+                </div>
+            </div>
+
+            <div class="lg:col-span-3 glass-effect p-6 shadow-2xl fade-in">
+                <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+                    <span class="text-2xl">🏔️</span>
+                    <span>Implied Volatility Surface</span>
+                </h3>
+                <div id="iv-surface-container" class="hidden">
+                    <div id="iv-surface-plot" style="width:100%; height:500px;"></div>
+                </div>
+                <div id="iv-surface-loading" class="hidden text-center py-8">
+                    <div class="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-cyan-500 mx-auto mb-2"></div>
+                    <p class="text-gray-400">Generating 3D volatility surface...</p>
+                </div>
+                <div id="iv-surface-empty" class="text-center py-8 text-gray-500">
+                    Calculate portfolio risk to view implied volatility surface.
+                </div>
+            </div>
         </main>
 
         <footer class="text-center mt-8 text-gray-400 opacity-60 text-sm">
@@ -246,6 +282,11 @@
             apiOnline: false,
             calculating: false
         };
+
+        const CHARTS = {
+            timeSeries: null,
+            ivSurface: null
+        };
         const ELEMENTS = {
             instrumentForm: document.getElementById('instrument-form'),
             assetIdInput: document.getElementById('asset-id'),
@@ -264,7 +305,13 @@
             errorMessage: document.getElementById('error-message'),
             initialState: document.getElementById('initial-state'),
             apiStatusIndicator: document.getElementById('api-status-indicator'),
-            apiStatusText: document.getElementById('api-status-text')
+            apiStatusText: document.getElementById('api-status-text'),
+            timeSeriesContainer: document.getElementById('time-series-container'),
+            timeSeriesLoading: document.getElementById('time-series-loading'),
+            timeSeriesEmpty: document.getElementById('time-series-empty'),
+            ivSurfaceContainer: document.getElementById('iv-surface-container'),
+            ivSurfaceLoading: document.getElementById('iv-surface-loading'),
+            ivSurfaceEmpty: document.getElementById('iv-surface-empty')
         };
         const showError = (message) => {
             ELEMENTS.errorMessage.textContent = message;
@@ -482,6 +529,203 @@
                 maximumFractionDigits: decimals
             });
         };
+
+        const createTimeSeriesChart = (timeSeriesData) => {
+            const ctx = document.getElementById('time-series-chart').getContext('2d');
+
+            const labels = timeSeriesData.map(point => `${point.days}d`);
+            const datasets = [
+                {
+                    label: 'Delta',
+                    data: timeSeriesData.map(point => point.delta),
+                    borderColor: 'rgb(6, 182, 212)',
+                    backgroundColor: 'rgba(6, 182, 212, 0.1)',
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Gamma',
+                    data: timeSeriesData.map(point => point.gamma),
+                    borderColor: 'rgb(34, 197, 94)',
+                    backgroundColor: 'rgba(34, 197, 94, 0.1)',
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Vega',
+                    data: timeSeriesData.map(point => point.vega),
+                    borderColor: 'rgb(168, 85, 247)',
+                    backgroundColor: 'rgba(168, 85, 247, 0.1)',
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'Theta',
+                    data: timeSeriesData.map(point => point.theta),
+                    borderColor: 'rgb(239, 68, 68)',
+                    backgroundColor: 'rgba(239, 68, 68, 0.1)',
+                    yAxisID: 'y'
+                },
+                {
+                    label: 'VaR 95%',
+                    data: timeSeriesData.map(point => point.var),
+                    borderColor: 'rgb(245, 158, 11)',
+                    backgroundColor: 'rgba(245, 158, 11, 0.1)',
+                    yAxisID: 'y1'
+                }
+            ];
+
+            if (CHARTS.timeSeries) {
+                CHARTS.timeSeries.destroy();
+            }
+
+            CHARTS.timeSeries = new Chart(ctx, {
+                type: 'line',
+                data: { labels, datasets },
+                options: {
+                    responsive: true,
+                    interaction: {
+                        mode: 'index',
+                        intersect: false,
+                    },
+                    plugins: {
+                        title: {
+                            display: true,
+                            text: 'Greeks & VaR Over Time'
+                        },
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    return `${context.dataset.label}: ${formatValue(context.parsed.y)}`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            display: true,
+                            title: {
+                                display: true,
+                                text: 'Time Horizon (Days)'
+                            }
+                        },
+                        y: {
+                            type: 'linear',
+                            display: true,
+                            position: 'left',
+                            title: {
+                                display: true,
+                                text: 'Greek Values'
+                            }
+                        },
+                        y1: {
+                            type: 'linear',
+                            display: true,
+                            position: 'right',
+                            title: {
+                                display: true,
+                                text: 'VaR ($)'
+                            },
+                            grid: {
+                                drawOnChartArea: false,
+                            }
+                        }
+                    }
+                }
+            });
+        };
+
+        const createIVSurfacePlot = (surfaceData) => {
+            const { strikes, expiries, iv_matrix } = surfaceData;
+
+            const data = [{
+                x: strikes,
+                y: expiries,
+                z: iv_matrix,
+                type: 'surface',
+                colorscale: 'Viridis',
+                name: 'Implied Volatility'
+            }];
+
+            const layout = {
+                title: 'Implied Volatility Surface',
+                scene: {
+                    xaxis: { title: 'Strike Price ($)' },
+                    yaxis: { title: 'Time to Expiry (Years)' },
+                    zaxis: { title: 'Implied Volatility' },
+                    camera: {
+                        eye: { x: 1.5, y: 1.5, z: 1.5 }
+                    }
+                },
+                margin: { l: 0, r: 0, t: 40, b: 0 }
+            };
+
+            Plotly.newPlot('iv-surface-plot', data, layout, { responsive: true });
+        };
+
+        const updateCharts = async () => {
+            if (STATE.portfolio.length === 0 || !STATE.apiOnline) return;
+
+            // Update time series
+            ELEMENTS.timeSeriesEmpty.classList.add('hidden');
+            ELEMENTS.timeSeriesLoading.classList.remove('hidden');
+            ELEMENTS.timeSeriesContainer.classList.add('hidden');
+
+            try {
+                const timeSeriesPayload = {
+                    portfolio: STATE.portfolio,
+                    market_data: STATE.marketData,
+                    time_points: [1, 7, 14, 21, 30, 60, 90]
+                };
+
+                const timeSeriesResponse = await fetch(`${CONFIG.API_BASE_URL}/analytics/greeks_time_series`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(timeSeriesPayload)
+                });
+
+                if (timeSeriesResponse.ok) {
+                    const timeSeriesData = await timeSeriesResponse.json();
+                    createTimeSeriesChart(timeSeriesData.time_series);
+                    ELEMENTS.timeSeriesContainer.classList.remove('hidden');
+                } else {
+                    console.error('Failed to fetch time series data');
+                }
+            } catch (error) {
+                console.error('Error fetching time series:', error);
+            } finally {
+                ELEMENTS.timeSeriesLoading.classList.add('hidden');
+            }
+
+            // Update IV surface
+            ELEMENTS.ivSurfaceEmpty.classList.add('hidden');
+            ELEMENTS.ivSurfaceLoading.classList.remove('hidden');
+            ELEMENTS.ivSurfaceContainer.classList.add('hidden');
+
+            try {
+                const ivSurfacePayload = {
+                    portfolio: STATE.portfolio,
+                    market_data: STATE.marketData,
+                    strike_range: { min: 50, max: 150, steps: 21 },
+                    expiry_range: { min: 0.1, max: 2.0, steps: 20 }
+                };
+
+                const ivSurfaceResponse = await fetch(`${CONFIG.API_BASE_URL}/analytics/iv_surface`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(ivSurfacePayload)
+                });
+
+                if (ivSurfaceResponse.ok) {
+                    const ivSurfaceData = await ivSurfaceResponse.json();
+                    createIVSurfacePlot(ivSurfaceData.surface);
+                    ELEMENTS.ivSurfaceContainer.classList.remove('hidden');
+                } else {
+                    console.error('Failed to fetch IV surface data');
+                }
+            } catch (error) {
+                console.error('Error fetching IV surface:', error);
+            } finally {
+                ELEMENTS.ivSurfaceLoading.classList.add('hidden');
+            }
+        };
         const getMetricColor = (label, value) => {
             if (label.includes('VaR')) return 'text-red-400';
             if (label === 'Total PV') return value >= 0 ? 'text-green-400' : 'text-red-400';
@@ -536,6 +780,9 @@
                 ELEMENTS.resultsContainer.classList.remove('hidden');
                 ELEMENTS.initialState.classList.add('hidden');
                 ELEMENTS.errorMessage.classList.add('hidden');
+
+                // Update charts after successful calculation
+                updateCharts();
             } catch (error) {
                 showError(`Error: ${error.message}. Ensure the Flask API is running on ${CONFIG.API_BASE_URL}`);
             } finally {
